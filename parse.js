@@ -67,7 +67,8 @@ function escapeText(s) {
 // is kept as %, and [ ] are encoded too).
 function cleanUrl(href) {
   try {
-    let out = encodeURI(href).replace(/%25/g, '%');
+    let out = encodeURI(href);
+    if (out.indexOf('%') !== -1) out = out.replace(/%25/g, '%');
     if (out.indexOf('[') !== -1) out = out.replace(/\[/g, '%5B').replace(/\]/g, '%5D');
     return out;
   } catch {
@@ -344,44 +345,50 @@ function stripFrom(line, offset, col, cols) {
 // Does `line` begin a complete HTML tag (open or close) at offset 0? Returns
 // the index just past `>` or -1. Tag syntax per CommonMark.
 function scanTagEnd(s) {
-  let i = 0;
+  return scanTagEndAt(s, 0, s.length);
+}
+
+// Index-based tag scan: text[p] is the first char after '<'; scans no
+// further than limit; returns the index just past the closing '>' or -1.
+function scanTagEndAt(text, p, limit) {
+  let i = p;
   let closing = false;
-  if (s[i] === '/') { closing = true; i++; }
-  if (i >= s.length || !/[a-zA-Z]/.test(s[i])) return -1;
+  if (text[i] === '/') { closing = true; i++; }
+  if (i >= limit || !/[a-zA-Z]/.test(text[i])) return -1;
   i++;
-  while (i < s.length && /[a-zA-Z0-9-]/.test(s[i])) i++;
+  while (i < limit && /[a-zA-Z0-9-]/.test(text[i])) i++;
   if (closing) {
     // a closing tag allows only whitespace before '>'
-    while (i < s.length && (s[i] === ' ' || s[i] === '\t' || s[i] === '\n')) i++;
-    return s[i] === '>' ? i + 1 : -1;
+    while (i < limit && (text[i] === ' ' || text[i] === '\t' || text[i] === '\n')) i++;
+    return text[i] === '>' ? i + 1 : -1;
   }
   // attributes
   for (;;) {
     let j = i;
-    while (j < s.length && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j++;
-    if (j >= s.length) return -1;
-    if (s[j] === '>') return j + 1;
-    if (s[j] === '/' && s[j + 1] === '>') return j + 2;
+    while (j < limit && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
+    if (j >= limit) return -1;
+    if (text[j] === '>') return j + 1;
+    if (text[j] === '/' && text[j + 1] === '>') return j + 2;
     if (j === i) return -1; // attributes must be preceded by whitespace
     // attribute name
-    if (!/[a-zA-Z_:]/.test(s[j])) return -1;
+    if (!/[a-zA-Z_:]/.test(text[j])) return -1;
     j++;
-    while (j < s.length && /[a-zA-Z0-9_.:-]/.test(s[j])) j++;
+    while (j < limit && /[a-zA-Z0-9_.:-]/.test(text[j])) j++;
     // optional value
     let k = j;
-    while (k < s.length && (s[k] === ' ' || s[k] === '\t')) k++;
-    if (s[k] === '=') {
+    while (k < limit && (text[k] === ' ' || text[k] === '\t')) k++;
+    if (text[k] === '=') {
       k++;
-      while (k < s.length && (s[k] === ' ' || s[k] === '\t')) k++;
-      if (k >= s.length) return -1;
-      const q = s[k];
+      while (k < limit && (text[k] === ' ' || text[k] === '\t')) k++;
+      if (k >= limit) return -1;
+      const q = text[k];
       if (q === '"' || q === "'") {
-        const e = s.indexOf(q, k + 1);
-        if (e === -1) return -1;
+        const e = text.indexOf(q, k + 1);
+        if (e === -1 || e >= limit) return -1;
         j = e + 1;
       } else {
         if (/[\s"'=<>`]/.test(q)) return -1;
-        while (k < s.length && !/[\s"'=<>`]/.test(s[k])) k++;
+        while (k < limit && !/[\s"'=<>`]/.test(text[k])) k++;
         j = k;
       }
     }
@@ -632,8 +639,9 @@ function interruptsParagraph(lines, i, inItem) {
     const hb = htmlBlockStart(line, ind.end);
     if (hb && hb.kind !== 'tag') return true;
     if (hb && hb.kind === 'tag') {
-      // only type-6 (block tags) interrupt; htmlBlockStart returns 'tag' for
-      // both — distinguish by tag name
+      // type-6 (block tags) interrupt everywhere; inside a list item,
+      // marked's text token also stops before a type-7 complete tag
+      if (inItem) return true;
       const m = /^<\/?([a-zA-Z][a-zA-Z0-9-]*)/.exec(rest);
       if (m && BLOCK_TAGS.has(m[1].toLowerCase())) return true;
     }
@@ -645,22 +653,48 @@ function interruptsParagraph(lines, i, inItem) {
 // table conversion. Returns { nodes, end }.
 function parseParagraph(lines, i, refs, noSetext, textLines, inItem, docTail, endsWithNl) {
   const paraLines = [lines[i]];
+  const rawLines = [lines[i]];
+  const merged = [false]; // paraLines[k] came from an indented code merge
+  // join paragraph text: a maximal run of code-merged lines is followed by
+  // an extra '\n' (the merged code token keeps its trailing newline) when
+  // more paragraph text follows, or at the end when `trailing` is set
+  const paraText = (arr, flags, trailing) => {
+    let out = arr[0];
+    for (let k = 1; k < arr.length; k++) {
+      out += '\n' + arr[k];
+      if (flags[k] && k + 1 < arr.length && !flags[k + 1]) out += '\n';
+    }
+    if (trailing && flags[flags.length - 1]) out += '\n';
+    return out;
+  };
+  let endByBlock = false;
   let j = i + 1;
   while (j < lines.length) {
     const line = lines[j];
     if (isBlank(line)) {
       // a whitespace-only final line with no trailing newline joins the
       // paragraph in marked (it cannot form a space token)
-      if (docTail && j === lines.length - 1) { paraLines.push(line); j++; }
+      if (docTail && j === lines.length - 1) { paraLines.push(line); rawLines.push(line); merged.push(false); j++; }
       break;
     }
     // a forced paragraph-text line (lazy/deep container continuation):
-    // never a block start, setext underline, or table delimiter
-    if (textLines && textLines.has(j)) { paraLines.push(line); j++; continue; }
+    // never a block start, setext underline, or table delimiter — except
+    // that inside a list item a type-7 HTML tag still ends the text token
+    if (textLines && textLines.has(j)) {
+      if (inItem) {
+        const lind = leadingIndent(line, 0);
+        if (lind.cols <= 3) {
+          const hb = htmlBlockStart(line, lind.end);
+          if (hb && hb.kind === 'tag') { endByBlock = true; break; }
+        }
+      }
+      paraLines.push(line); rawLines.push(line); merged.push(false); j++; continue;
+    }
     const ind = leadingIndent(line, 0);
     const sl = setextLevel(line, ind);
     if (sl && !(noSetext && noSetext.has(j))) {
-      const text = paraLines.join('\n').replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
+      // setext heading text is the raw paragraph text (no code merging)
+      const text = rawLines.join('\n').replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
       return { nodes: [{ t: 'heading', level: sl, text }], end: j + 1 };
     }
     // table: this line is a delimiter row and the last paragraph line is the header
@@ -669,23 +703,25 @@ function parseParagraph(lines, i, refs, noSetext, textLines, inItem, docTail, en
       const header = splitRow(paraLines[paraLines.length - 1]);
       if (header.length === align.length) {
         const nodes = [];
-        if (paraLines.length > 1) nodes.push({ t: 'para', text: paraLines.slice(0, -1).join('\n') });
+        if (paraLines.length > 1) nodes.push({ t: 'para', text: paraText(paraLines.slice(0, -1), merged.slice(0, -1), true) });
         const t = parseTable(lines, j - 1, { header, align }, endsWithNl);
         nodes.push(t.node);
         return { nodes, end: t.end };
       }
     }
-    if (interruptsParagraph(lines, j, inItem)) break;
+    if (interruptsParagraph(lines, j, inItem)) { endByBlock = true; break; }
     // table starting at this line (it is the header, next line the delimiter)
-    if (isTableStart(lines, j)) break;
+    if (isTableStart(lines, j)) { endByBlock = true; break; }
     // in a list item, marked lexes an indented (>= 4 cols) continuation
     // line as an indented code token and merges it into the text token
     // with 4 columns stripped (blockquote children keep the indent)
-    if (inItem && ind.cols >= 4) { paraLines.push(stripFrom(line, 0, 0, 4)); j++; continue; }
+    if (inItem && ind.cols >= 4) { paraLines.push(stripFrom(line, 0, 0, 4)); rawLines.push(line); merged.push(true); j++; continue; }
     paraLines.push(line);
+    rawLines.push(line);
+    merged.push(false);
     j++;
   }
-  return { nodes: [{ t: 'para', text: paraLines.join('\n') }], end: j };
+  return { nodes: [{ t: 'para', text: paraText(paraLines, merged, endByBlock) }], end: j };
 }
 
 // Consume an HTML block starting at lines[i]. Returns { node, end }.
@@ -872,9 +908,10 @@ function parseBlockquote(lines, i, refs, endsWithNl) {
       continue;
     }
     // lazy continuation: only for an open inner paragraph, and the line must
-    // not itself start an interrupting block; marked strips 4 columns from
-    // deeply-indented lazy lines
-    if (inner.length > 0 && lastInnerKind === 'para' && !inFence && !interruptsParagraph(lines, j) && !sl) {
+    // not itself start an interrupting block; a list marker of any kind
+    // (even a contentless one, or an ordered marker != 1) ends the quote;
+    // marked strips 4 columns from deeply-indented lazy lines
+    if (inner.length > 0 && lastInnerKind === 'para' && !inFence && !interruptsParagraph(lines, j) && !sl && !(ind.cols <= 3 && matchListItem(line, ind))) {
       noSetext.add(inner.length);
       inner.push(ind.cols >= 4 ? stripFrom(line, 0, 0, 4) : line);
       lastWasLazy = true;
@@ -976,6 +1013,7 @@ function parseList(lines, i, refs, endsWithNl) {
     const syntheticBlanks = new Set();
     const textLines = new Set();
     const firstLineBlank = !item.hasContent;
+    let sawContent = item.hasContent;
     // kind of the item's current last inner block: 'para' (an open paragraph
     // at any nesting depth), 'list', or 'other' — drives laziness/deep rules
     let lastKind = firstLineBlank ? 'other' : kindOfItemLine(itemLines[0]);
@@ -1002,9 +1040,11 @@ function parseList(lines, i, refs, endsWithNl) {
         if (k >= lines.length) { j = blankStart; endList = true; break; }
         const kind = leadingIndent(lines[k], 0);
         const nextItem = !isHr(lines[k], kind) && matchListItem(lines[k], kind);
-        if (firstLineBlank) {
-          // an item whose first line is blank: a following same-list item
-          // continues the (loose) list; anything else ends it here
+        if (firstLineBlank && !sawContent) {
+          // an item with no content gathered yet whose first line is blank:
+          // a following same-list item continues the (loose) list; anything
+          // else ends it here (once content exists, the normal blank rules
+          // below apply — indented content after a blank stays in the item)
           if (nextItem && sameList(first, nextItem) && kind.cols < ci) {
             betweenLoose = true;
             j = k;
@@ -1047,6 +1087,7 @@ function parseList(lines, i, refs, endsWithNl) {
       if (lind.cols >= ci) {
         const s = stripFrom(L, 0, 0, ci);
         itemLines.push(s);
+        sawContent = true;
         if (inFence) {
           const f = matchFence(s, leadingIndent(s, 0));
           if (f && f.ch === inFence.ch && f.len >= inFence.len && f.info === '') inFence = null;
@@ -1066,6 +1107,7 @@ function parseList(lines, i, refs, endsWithNl) {
       const prevM = itemLines[itemLines.length - 1];
       if (prevBlank || prevLineBreak(prevM, ci)) { endList = true; break; }
       textLines.add(itemLines.length);
+      sawContent = true;
       if (/^ {0,3}(?:=+|-+) *$/.test(L) && lastKind === 'para') {
         // setext-shaped lazy line: rewritten with a 4-space prefix
         itemLines.push('    ' + L.replace(/^ {0,3}/, ''));
@@ -1080,9 +1122,11 @@ function parseList(lines, i, refs, endsWithNl) {
     // trailing blank lines in itemLines don't count toward looseness
     const trimmed = itemLines.slice();
     while (trimmed.length && isBlank(trimmed[trimmed.length - 1])) trimmed.pop();
-    // marked trims the item's raw text: trailing spaces/tabs on the last
-    // content line are dropped
-    if (trimmed.length) trimmed[trimmed.length - 1] = trimmed[trimmed.length - 1].replace(/[ \t]+$/, '');
+    // marked trims trailing spaces/tabs on the item's last content line
+    // only when this item is the last of its list (the list raw ends there)
+    if (trimmed.length && (endList || j >= lines.length)) {
+      trimmed[trimmed.length - 1] = trimmed[trimmed.length - 1].replace(/[ \t]+$/, '');
+    }
     const children = parseBlocks(trimmed, refs, false, null, syntheticBlanks, textLines, true);
     items.push(children);
     if (itemDone) continue;
@@ -1247,6 +1291,9 @@ const HEX_ENTITY_RE = /^&#[xX]([0-9a-fA-F]{1,6});/;
 const NAMED_ENT_RE = /^&(\w+);/;
 const SCHEME_AUTOLINK_RE = /^<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^<>\s]*)>/;
 const EMAIL_AUTOLINK_RE = /^<([a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+)>/;
+const SCHEME_AUTOLINK_RE_Y = /<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^<>\s]*)>/y;
+const EMAIL_AUTOLINK_RE_Y = /<([a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+)>/y;
+const EMAIL_DOMAIN_RE_Y = /[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9_](?:[a-zA-Z0-9_-]*[a-zA-Z0-9_])?)*\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?/y;
 
 function decodeNumeric(v) {
   if (v === 0 || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) return '\uFFFD';
@@ -1408,15 +1455,149 @@ function linkInText(t, refs) {
   return false;
 }
 
+// Code region at r (a backtick run): run + [^`]+ content + a closing run of
+// exactly the same length; returns the index just past the region or -1.
+// (Mirrors the (`+)[^`]+\1(?!`) shape used by marked's mask patterns.)
+function maskRegionEnd(t, r) {
+  const n = t.length;
+  let L = 0;
+  while (r + L < n && t[r + L] === '`') L++;
+  if (L === 0) return -1;
+  let j = r + L;
+  if (j >= n || t[j] === '`') return -1; // content must be >= 1 char
+  while (j < n && t[j] !== '`') j++;
+  if (j >= n) return -1;
+  let L2 = 0;
+  while (j + L2 < n && t[j + L2] === '`') L2++;
+  return L2 === L ? j + L2 : -1;
+}
+
+// marked's mask step B: inside a full code span, inner backticks become
+// '+'; an escape of a punctuation character becomes '++'. (Hand scanner,
+// behaviorally identical to the original regex pass.)
+function maskStepB(t) {
+  const n = t.length;
+  let out = '';
+  let plain = 0;
+  let i = 0;
+  while (i < n) {
+    const c = t[i];
+    if (c === '`') {
+      let L = 0;
+      while (i + L < n && t[i + L] === '`') L++;
+      let j = i + L;
+      let closeStart = -1;
+      while (j < n) {
+        if (t[j] === '`') {
+          let L2 = 0;
+          while (j + L2 < n && t[j + L2] === '`') L2++;
+          if (L2 === L && j > i + L) { closeStart = j; break; }
+          j += L2;
+        } else j++;
+      }
+      if (closeStart !== -1) {
+        out += t.slice(plain, i) + t.slice(i, i + L) +
+          t.slice(i + L, closeStart).replace(/`/g, '+') + t.slice(closeStart, closeStart + L);
+        i = closeStart + L;
+        plain = i;
+      } else {
+        i += L;
+      }
+      continue;
+    }
+    if (c === '\\' && i + 1 < n && isPunct(t[i + 1])) {
+      out += t.slice(plain, i) + '++';
+      i += 2;
+      plain = i;
+      continue;
+    }
+    i++;
+  }
+  return out + t.slice(plain, n);
+}
+
+// marked's mask blockSkip pass: inline-link constructs, code regions (with
+// a preserved 1-char prefix) and HTML tags are replaced by '[aaa...]'.
+// (Hand scanner, behaviorally identical to the original regex pass.)
+function maskLinkConstructEnd(t, i) {
+  const n = t.length;
+  let k = i + 1;
+  while (k < n) {
+    const c = t[k];
+    if (c === '`') {
+      const e = maskRegionEnd(t, k);
+      if (e === -1) return -1;
+      k = e;
+      continue;
+    }
+    if (c === '[') return -1;
+    if (c === ']') break;
+    k++;
+  }
+  if (k >= n || t[k] !== ']' || t[k + 1] !== '(') return -1;
+  let p = k + 2;
+  while (p < n) {
+    const c = t[p];
+    if (c === '\\') { p += 2; continue; }
+    if (c === '(') {
+      p++;
+      let closed = false;
+      while (p < n) {
+        const d = t[p];
+        if (d === '\\') { p += 2; continue; }
+        if (d === '(') return -1;
+        if (d === ')') { p++; closed = true; break; }
+        p++;
+      }
+      if (!closed) return -1;
+      continue;
+    }
+    if (c === ')') return p + 1;
+    p++;
+  }
+  return -1;
+}
+
+function maskBlockSkip(t) {
+  const n = t.length;
+  let out = '';
+  let plain = 0;
+  let i = 0;
+  while (i < n) {
+    const c = t[i];
+    let end = -1, prefixLen = 0;
+    if (c === '[') {
+      end = maskLinkConstructEnd(t, i);
+    }
+    if (end === -1 && c !== '`' && t[i + 1] === '`') {
+      end = maskRegionEnd(t, i + 1);
+      prefixLen = 1;
+    }
+    if (end === -1 && i === 0 && c === '`') {
+      end = maskRegionEnd(t, 0);
+    }
+    if (end === -1 && c === '<' && t[i + 1] !== ' ') {
+      let k = i + 1;
+      while (k < n && t[k] !== '>' && t[k] !== '<') k++;
+      if (k < n && t[k] === '>') end = k + 1;
+    }
+    if (end !== -1) {
+      out += t.slice(plain, i) + t.slice(i, i + prefixLen) +
+        '[' + 'a'.repeat(Math.max(0, end - i - prefixLen - 2)) + ']';
+      i = end;
+      plain = end;
+      continue;
+    }
+    i++;
+  }
+  return out + t.slice(plain, n);
+}
+
 function maskText(text, refs) {
   let t = text;
   if (t.includes('[') && refs && refs.size > 0) t = maskRefLinks(t, refs);
-  t = t.replace(MASK_STEP_B, (n, s, r) => r ? '+'.repeat(n.length)
-    : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
-  t = t.replace(MASK_BLOCK_SKIP, (n, g1, prefix) => {
-    const o = prefix ? prefix.length : 0;
-    return n.slice(0, o) + '[' + 'a'.repeat(Math.max(0, n.length - o - 2)) + ']';
-  });
+  if (t.includes('`') || t.includes('\\')) t = maskStepB(t);
+  if (t.includes('[') || t.includes('`') || t.includes('<')) t = maskBlockSkip(t);
   return t;
 }
 
@@ -1424,20 +1605,17 @@ function maskText(text, refs) {
 // or capture a closer run in groups 1..6, classified by the classes of the
 // characters around the run. GFM set: Ast uses (?!~) classes; Und/Del use
 // plain punctuation classes, and Und has no intraword closer alternative.
-function rdelimAst() {
-  return /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?=[\s]|$)|(?:[^\s\p{P}\p{S}]|~)(\*+)(?!\*)(?=(?!~)[\s\p{P}\p{S}]|$)|(?!\*)(?!~)[\s\p{P}\p{S}](\*+)(?=(?:[^\s\p{P}\p{S}]|~))|[\s](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?:[^\s\p{P}\p{S}]|~)(\*+)(?=(?:[^\s\p{P}\p{S}]|~))/gu;
-}
-function rdelimUnd() {
-  return /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)|[^_]+(?=[^_])|(?!_)[\p{P}\p{S}](_+)(?=[\s]|$)|[^\s\p{P}\p{S}](_+)(?!_)(?=[\s\p{P}\p{S}]|$)|(?!_)[\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])|[\s](_+)(?!_)(?=[\p{P}\p{S}])|(?!_)[\p{P}\p{S}](_+)(?!_)(?=[\p{P}\p{S}])/gu;
-}
-function rdelimDel() {
-  return /^[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
-}
+const RDELIM_AST = /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?=[\s]|$)|(?:[^\s\p{P}\p{S}]|~)(\*+)(?!\*)(?=(?!~)[\s\p{P}\p{S}]|$)|(?!\*)(?!~)[\s\p{P}\p{S}](\*+)(?=(?:[^\s\p{P}\p{S}]|~))|[\s](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?:[^\s\p{P}\p{S}]|~)(\*+)(?=(?:[^\s\p{P}\p{S}]|~))/gu;
+const RDELIM_UND = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)|[^_]+(?=[^_])|(?!_)[\p{P}\p{S}](_+)(?=[\s]|$)|[^\s\p{P}\p{S}](_+)(?!_)(?=[\s\p{P}\p{S}]|$)|(?!_)[\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])|[\s](_+)(?!_)(?=[\p{P}\p{S}])|(?!_)[\p{P}\p{S}](_+)(?!_)(?=[\p{P}\p{S}])/gu;
+const RDELIM_DEL = /^[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
 
 // Start index of the last run of `ch` in the masked text whose preceding
 // character is not blank (marked's lastPossible(EmStrong|Del)CloserIndex).
-function lastPossibleCloser(masked, ch) {
-  let idx = -1;
+// fillClosers computes all three delimiter kinds in a single pass.
+function fillClosers(masked, emCtx) {
+  emCtx['*'] = -1;
+  emCtx['_'] = -1;
+  emCtx['~'] = -1;
   const n = masked.length;
   for (let s = 0; s < n; s++) {
     const r = masked[s];
@@ -1445,15 +1623,39 @@ function lastPossibleCloser(masked, ch) {
     let i = s + 1;
     while (i < n && masked[i] === r) i++;
     const prev = s === 0 ? '\n' : masked[s - 1];
-    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f' && r === ch) idx = s;
+    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') emCtx[r] = s;
     s = i - 1;
   }
-  return idx;
+}
+
+// Classify a potential closer run for marked's RDelim patterns: given the
+// delimiter kind and the classes of the characters before/after the run,
+// returns the capture group number (1..6) or 0 when no alternative matches.
+// Ast ('*') uses (?!~) punctuation classes and has group 6; Und ('_') uses
+// plain classes and has no group 6; Del ('~') uses plain classes with all 6.
+function rdelimGroup(ch, prevC, nextC) {
+  const ast = ch === '*';
+  const isP = (c) => c !== '' && isPunct(c) && (!ast || c !== '~');
+  const isW = (c) => c === '' || isWs(c);
+  const P = isP(prevC), W = isW(prevC);
+  const nP = isP(nextC), nW = isW(nextC);
+  const O = !P && !W, nO = !nP && !nW;
+  if (P && nW) return 1;
+  if (O && (nP || nW)) return 2;
+  if ((P || W) && nO) return 3;
+  if (W && nP) return 4;
+  if (P && nP) return 5;
+  if (O && nO) return ch === '_' ? 0 : 6;
+  return 0;
+}
+
+function utf16Len(c) {
+  return c.codePointAt(0) > 0xFFFF ? 2 : 1;
 }
 
 // Try to form an em/strong token at text[pos] (a run of '*' or '_').
 // Returns { node, end } or null.
-function tryEmStrong(text, masked, pos, refs, st) {
+function tryEmStrong(text, masked, pos, refs, st, emCtx) {
   const ch = text[pos];
   let run = 0;
   while (pos + run < text.length && text[pos + run] === ch) run++;
@@ -1478,12 +1680,65 @@ function tryEmStrong(text, masked, pos, refs, st) {
   const sameCharBefore = rawPrev === ch;
   const y = (pos - l) + k;
   const canAlsoClose = p !== '' && p.trim() !== '' && (d !== '' || (ch === '*' && !h));
-  const v = lastPossibleCloser(masked, ch);
+  if (emCtx[ch] === -2) fillClosers(masked, emCtx);
+  const v = emCtx[ch];
   const Q = pos + k;
   if (v < Q) return null;
   const ee = v - Q;
+  // Fast path: marked's RDelim scan only ever captures a run at its first
+  // character with its full length (the (?!*) / (?!_) guards rule out
+  // partial captures), so the first captured run decides most cases. The
+  // only earlier construct that could consume the candidate is the
+  // anchored '__' / '**' skip pattern; when it might apply, or when the
+  // first captured run changes the scan state (groups 3/4, rule of 3, or
+  // not enough closer length), fall back to the exact regex loop below.
+  {
+    const other = ch === '*' ? '_' : '*';
+    let s = Q;
+    while (s < masked.length && masked[s] !== ch) s++;
+    if (s < masked.length) {
+      let runLen = 0;
+      while (masked[s + runLen] === ch) runLen++;
+      let danger = false;
+      let w = Q;
+      while (w < s && masked[w] !== other) w++;
+      if (w < s && masked[w + 1] === other) danger = true;
+      if (!danger && runLen === 1) {
+        let w2 = s + 1;
+        while (w2 < masked.length && masked[w2] !== '*' && masked[w2] !== '_') w2++;
+        if (masked[w2] === other && masked[w2 + 1] === other) danger = true;
+      }
+      if (!danger) {
+        const nextC = s + runLen < masked.length ? masked[s + runLen] : '';
+        const g = rdelimGroup(ch, masked[s - 1], nextC);
+        if (g !== 0 && g !== 3 && g !== 4) {
+          const b = runLen;
+          let fallsBack = false;
+          if (g === 5 || g === 6) {
+            if (sameCharBefore) return null;
+            if (y % 3 !== 0 && (y + b) % 3 === 0) fallsBack = true;
+          } else if (canAlsoClose && y % 3 !== 0 && (y + b) % 3 === 0) {
+            fallsBack = true;
+          }
+          if (!fallsBack) {
+            const m2 = k - b;
+            if (m2 <= 0) {
+              const bUse = Math.min(b, b + m2);
+              const rawLen = k + (s - Q) + bUse;
+              const raw = text.slice(pos, pos + rawLen);
+              if (Math.min(k, bUse) % 2 === 1) {
+                return { node: { k: 'em', children: parseInline(raw.slice(1, -1), refs, st) }, end: pos + rawLen };
+              }
+              return { node: { k: 'strong', children: parseInline(raw.slice(2, -2), refs, st) }, end: pos + rawLen };
+            }
+          }
+        }
+      }
+    }
+  }
   const t = masked.slice(Q);
-  const A = ch === '*' ? rdelimAst() : rdelimUnd();
+  const A = ch === '*' ? RDELIM_AST : RDELIM_UND;
+  A.lastIndex = 0;
   let m = k, f = 0, match;
   while ((match = A.exec(t)) !== null && !(match.index > ee)) {
     const g = match[1] || match[2] || match[3] || match[4] || match[5] || match[6];
@@ -1509,7 +1764,7 @@ function tryEmStrong(text, masked, pos, refs, st) {
 }
 
 // Try to form a del token at text[pos] (a run of 1-2 '~').
-function tryDel(text, masked, pos, refs, st) {
+function tryDel(text, masked, pos, refs, st, emCtx) {
   let run = 0;
   while (pos + run < text.length && text[pos + run] === '~') run++;
   if (run > 2) return null;
@@ -1519,23 +1774,45 @@ function tryDel(text, masked, pos, refs, st) {
   const s1 = isPunct(after) ? after : '';
   if (!(s1 === '' || prevCh === '' || punctSpaceExec(prevCh))) return null;
   const o = run;
-  const u = lastPossibleCloser(masked, '~');
+  if (emCtx['~'] === -2) fillClosers(masked, emCtx);
+  const u = emCtx['~'];
   const d0 = pos + o;
   if (u < d0) return null;
-  const t = masked.slice(d0);
-  const A = rdelimDel();
-  let p = o, match;
-  while ((match = A.exec(t)) !== null && !(match.index > u - d0)) {
-    const g = match[1] || match[2] || match[3] || match[4] || match[5] || match[6];
-    if (!g || g.length !== o) continue;
-    if (match[3] || match[4]) { p += g.length; continue; }
-    p -= g.length;
-    if (p > 0) continue;
-    const len = Math.min(g.length, g.length + p);
-    const te = match[0].codePointAt(0) > 0xFFFF ? 2 : 1;
-    const rawLen = o + match.index + te + len;
-    const raw = text.slice(pos, pos + rawLen);
-    return { node: { k: 'del', children: parseInline(raw.slice(o, raw.length - o), refs, st) }, end: pos + rawLen };
+  // Manual equivalent of the RDelimDel regex loop: runs are only ever
+  // captured whole at their first character (a capture shorter than the
+  // run would be followed by '~', which satisfies no group's lookahead),
+  // and runs longer than 2 are never captured ((~~?) takes at most 2).
+  let p = o;
+  let s = d0;
+  const bound = u - d0;
+  while (s < masked.length) {
+    if (masked[s] !== '~') { s++; continue; }
+    let runLen = 0;
+    while (masked[s + runLen] === '~') runLen++;
+    if (runLen <= 2) {
+      const prevC = masked[s - 1];
+      const nextC = s + runLen < masked.length ? masked[s + runLen] : '';
+      const g = rdelimGroup('~', prevC, nextC);
+      if (g !== 0) {
+        const te = utf16Len(prevC);
+        const matchIndex = s - te - d0;
+        if (matchIndex > bound) return null;
+        if (runLen === o) {
+          if (g === 3 || g === 4) {
+            p += runLen;
+          } else {
+            p -= runLen;
+            if (p <= 0) {
+              const len = Math.min(runLen, runLen + p);
+              const rawLen = o + matchIndex + te + len;
+              const raw = text.slice(pos, pos + rawLen);
+              return { node: { k: 'del', children: parseInline(raw.slice(o, raw.length - o), refs, st) }, end: pos + rawLen };
+            }
+          }
+        }
+      }
+    }
+    s += runLen;
   }
   return null;
 }
@@ -1562,29 +1839,30 @@ function codeSpanLenAt(text, pos) {
 }
 
 function tagOrAutolinkLen(text, pos) {
-  const rest = text.slice(pos, pos + 2000);
-  if (rest.startsWith('<!--->')) return 6;
-  if (rest.startsWith('<!-->')) return 5;
-  if (rest.startsWith('<!--')) {
+  if (text.startsWith('<!--->', pos)) return 6;
+  if (text.startsWith('<!-->', pos)) return 5;
+  if (text.startsWith('<!--', pos)) {
     const e = text.indexOf('-->', pos + 4);
     return e === -1 ? 0 : e + 3 - pos;
   }
-  if (rest.startsWith('<?')) {
+  if (text.startsWith('<?', pos)) {
     const e = text.indexOf('?>', pos + 2);
     return e === -1 ? 0 : e + 2 - pos;
   }
-  if (rest.startsWith('<![CDATA[')) {
+  if (text.startsWith('<![CDATA[', pos)) {
     const e = text.indexOf(']]>', pos + 9);
     return e === -1 ? 0 : e + 3 - pos;
   }
-  if (/^<![A-Z]/.test(rest)) {
+  if (text[pos + 1] === '!' && text[pos + 2] >= 'A' && text[pos + 2] <= 'Z') {
     const e = text.indexOf('>', pos + 2);
     return e === -1 ? 0 : e + 1 - pos;
   }
-  const m = SCHEME_AUTOLINK_RE.exec(rest) || EMAIL_AUTOLINK_RE.exec(rest);
+  SCHEME_AUTOLINK_RE_Y.lastIndex = pos;
+  let m = SCHEME_AUTOLINK_RE_Y.exec(text);
+  if (!m) { EMAIL_AUTOLINK_RE_Y.lastIndex = pos; m = EMAIL_AUTOLINK_RE_Y.exec(text); }
   if (m) return m[0].length;
-  const te = scanTagEnd(text.slice(pos + 1, pos + 2000));
-  return te === -1 ? 0 : 1 + te;
+  const te = scanTagEndAt(text, pos + 1, Math.min(text.length, pos + 2000));
+  return te === -1 ? 0 : te - pos;
 }
 
 function labelHasExtendingTag(text, pos, isImage, label) {
@@ -1707,6 +1985,7 @@ function parseInline(text, refs, st) {
   const savedParenPossible = st.linkParenPossible;
   st.linkParenPossible = savedParenPossible && text.includes(')');
   const masked = (text.includes('*') || text.includes('_') || text.includes('~')) ? maskText(text, refs) : text;
+  const emCtx = { '*': -2, '_': -2, '~': -2 };
   const nodes = [];
   let buf = '';
   const n = text.length;
@@ -1764,49 +2043,50 @@ function parseInline(text, refs, st) {
       continue;
     }
     if (c === '<') {
-      const rest = text.slice(i, i + 2000);
-      if (rest.startsWith('<!--')) {
+      if (text.startsWith('<!--', i)) {
         // marked accepts the abrupt comment closings as complete comments
-        if (rest.startsWith('<!--->')) { flush(); nodes.push({ k: 'raw', s: '<!--->' }); i += 6; continue; }
-        if (rest.startsWith('<!-->')) { flush(); nodes.push({ k: 'raw', s: '<!-->' }); i += 5; continue; }
+        if (text.startsWith('<!--->', i)) { flush(); nodes.push({ k: 'raw', s: '<!--->' }); i += 6; continue; }
+        if (text.startsWith('<!-->', i)) { flush(); nodes.push({ k: 'raw', s: '<!-->' }); i += 5; continue; }
         const e = text.indexOf('-->', i + 4);
         if (e !== -1) { flush(); nodes.push({ k: 'raw', s: text.slice(i, e + 3) }); i = e + 3; continue; }
       }
-      if (rest.startsWith('<?')) {
+      if (text.startsWith('<?', i)) {
         const e = text.indexOf('?>', i + 2);
         if (e !== -1) { flush(); nodes.push({ k: 'raw', s: text.slice(i, e + 2) }); i = e + 2; continue; }
       }
-      if (rest.startsWith('<![CDATA[')) {
+      if (text.startsWith('<![CDATA[', i)) {
         const e = text.indexOf(']]>', i + 9);
         if (e !== -1) { flush(); nodes.push({ k: 'raw', s: text.slice(i, e + 3) }); i = e + 3; continue; }
       }
-      if (/^<![A-Z]/.test(rest)) {
+      if (text[i + 1] === '!' && text[i + 2] >= 'A' && text[i + 2] <= 'Z') {
         const e = text.indexOf('>', i + 2);
         if (e !== -1) { flush(); nodes.push({ k: 'raw', s: text.slice(i, e + 1) }); i = e + 1; continue; }
       }
-      let m = SCHEME_AUTOLINK_RE.exec(rest);
+      SCHEME_AUTOLINK_RE_Y.lastIndex = i;
+      let m = SCHEME_AUTOLINK_RE_Y.exec(text);
       if (m) {
         flush();
         nodes.push({ k: 'autolink', href: m[1], text: m[1] });
         i += m[0].length; continue;
       }
-      m = EMAIL_AUTOLINK_RE.exec(rest);
+      EMAIL_AUTOLINK_RE_Y.lastIndex = i;
+      m = EMAIL_AUTOLINK_RE_Y.exec(text);
       if (m) {
         flush();
         nodes.push({ k: 'autolink', href: 'mailto:' + m[1], text: m[1] });
         i += m[0].length; continue;
       }
-      const te = scanTagEnd(text.slice(i + 1, i + 2000));
+      const te = scanTagEndAt(text, i + 1, Math.min(n, i + 2000));
       if (te !== -1) {
         flush();
-        const tagText = text.slice(i, i + 1 + te);
+        const tagText = text.slice(i, te);
         nodes.push({ k: 'raw', s: tagText });
         // marked tracks a document-wide "in link" state from raw <a> tags:
         // '<a ' opens it, '</a>' / '</a >' closes it; while set, extension
         // autolinks (www / bare URL / bare email) do not form
         if (/^<a /i.test(tagText)) st.inLink = true;
         else if (/^<\/a[\s>]/i.test(tagText)) st.inLink = false;
-        i += 1 + te; continue;
+        i = te; continue;
       }
       buf += c; i++; continue;
     }
@@ -1831,7 +2111,7 @@ function parseInline(text, refs, st) {
       buf += c; i++; continue;
     }
     if (c === '*' || c === '_' || c === '~') {
-      const r = c === '~' ? tryDel(text, masked, i, refs, st) : tryEmStrong(text, masked, i, refs, st);
+      const r = c === '~' ? tryDel(text, masked, i, refs, st, emCtx) : tryEmStrong(text, masked, i, refs, st, emCtx);
       if (r) { flush(); nodes.push(r.node); i = r.end; continue; }
       buf += c; i++; continue;
     }
@@ -1844,7 +2124,8 @@ function parseInline(text, refs, st) {
       const local = text.slice(ls, i);
       let linked = false;
       if (local.length > 0 && !st.inLink && !(ls > 0 && text[ls - 1] === '\\')) {
-        const dm = EMAIL_DOMAIN_RE.exec(text.slice(i + 1, i + 300));
+        EMAIL_DOMAIN_RE_Y.lastIndex = i + 1;
+        const dm = EMAIL_DOMAIN_RE_Y.exec(text);
         if (dm) {
           const afterDom = text[i + 1 + dm[0].length];
           if (afterDom === undefined || !/[\w-]/.test(afterDom)) {
@@ -1928,13 +2209,16 @@ function parseInline(text, refs, st) {
       }
       buf += c; i++; continue;
     }
-    // plain text run: consume until the next special character
+    // plain text run: consume until the next special character ('w'/'h'
+    // only break the run when a www./http(s) autolink is plausible there)
     let j = i + 1;
     while (j < n) {
       const x = text[j];
       if (x === '\\' || x === '`' || x === '<' || x === '&' || x === '[' || x === ']' || x === '!' ||
-          x === '*' || x === '_' || x === '~' || x === '@' || x === '\n' || x === 'w' || x === 'h' ||
-          x === 'W' || x === 'H') break;
+          x === '*' || x === '_' || x === '~' || x === '@' || x === '\n') break;
+      if (x === 'w' && text[j + 1] === 'w' && text[j + 2] === 'w' && text[j + 3] === '.') break;
+      if ((x === 'h' || x === 'H') && (text[j + 1] === 't' || text[j + 1] === 'T') &&
+          (text[j + 2] === 't' || text[j + 2] === 'T') && (text[j + 3] === 'p' || text[j + 3] === 'P')) break;
       j++;
     }
     buf += text.slice(i, j);
@@ -2021,9 +2305,10 @@ function renderInlineNodes(nodes) {
 }
 
 function renderInline(text, refs, st) {
-  if (!/[*_~`[<\\!&@whWH]/.test(text)) {
-    // fast path: nothing inline-ish except possibly hard breaks / entities
-    if (text.indexOf('\n') === -1) return escapeText(text);
+  // fast path: no inline constructs at all (no emphasis/code/links/tags/
+  // entities/emails/www/http autolinks/hard breaks) -> just escape
+  if (!/[*_~`[<\\!&@]/.test(text) && !/www\.|http/i.test(text) && !text.includes('  \n')) {
+    return escapeText(text);
   }
   return renderInlineNodes(parseInline(text, refs, st));
 }
