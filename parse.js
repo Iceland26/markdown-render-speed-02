@@ -156,8 +156,15 @@ function isBlank(line) {
 // Link reference definitions
 // ---------------------------------------------------------------------------
 
+const labelNormCache = new Map();
 function normalizeLabel(label) {
-  return label.replace(/\s+/g, ' ').trim().toLowerCase().replace(/ß/g, 'ss').replace(/ς/g, 'σ');
+  let v = labelNormCache.get(label);
+  if (v === undefined) {
+    v = label.replace(/\s+/g, ' ').trim().toLowerCase().replace(/ß/g, 'ss').replace(/ς/g, 'σ');
+    if (labelNormCache.size > 4096) labelNormCache.clear();
+    labelNormCache.set(label, v);
+  }
+  return v;
 }
 
 // Parse a link destination starting at s[pos]: either <...> or a bare run
@@ -555,14 +562,17 @@ function splitRow(line) {
     cur += c; i++;
   }
   cells.push(cur);
-  // drop phantom cells from leading/trailing pipes
+  // drop phantom cells from leading/trailing pipes (marked drops both,
+  // even when that leaves the row with no cells at all, e.g. '|')
   const trimmedLine = line.trim();
-  if (cells.length > 1 && cells[0].trim() === '' && trimmedLine.startsWith('|')) cells.shift();
-  if (cells.length > 1 && cells[cells.length - 1].trim() === '' && /(^|[^\\])\|$/.test(trimmedLine)) cells.pop();
+  if (cells.length && cells[0].trim() === '' && trimmedLine.startsWith('|')) cells.shift();
+  if (cells.length && cells[cells.length - 1].trim() === '' && /(^|[^\\])\|$/.test(trimmedLine)) cells.pop();
   return cells.map(c => c.trim());
 }
 
 function parseDelimiter(line) {
+  // a delimiter row indented 4+ columns is not a table delimiter
+  if (leadingIndent(line, 0).cols > 3) return null;
   // must contain at least one unescaped pipe
   if (!/(^|[^\\])\|/.test(line)) return null;
   const cells = splitRow(line);
@@ -651,7 +661,7 @@ function interruptsParagraph(lines, i, inItem) {
 
 // Gather a paragraph starting at lines[i]; handles setext conversion and
 // table conversion. Returns { nodes, end }.
-function parseParagraph(lines, i, refs, noSetext, textLines, inItem, docTail, endsWithNl) {
+function parseParagraph(lines, i, refs, noSetext, textLines, inItem, docTail, endsWithNl, trailNl) {
   const paraLines = [lines[i]];
   const rawLines = [lines[i]];
   const merged = [false]; // paraLines[k] came from an indented code merge
@@ -675,6 +685,22 @@ function parseParagraph(lines, i, refs, noSetext, textLines, inItem, docTail, en
       // a whitespace-only final line with no trailing newline joins the
       // paragraph in marked (it cannot form a space token)
       if (docTail && j === lines.length - 1) { paraLines.push(line); rawLines.push(line); merged.push(false); j++; }
+      // in a list item, an indented code chunk merged into the paragraph
+      // spans blank lines: if the last line was code-merged and a later
+      // line is indented >= 4 again, the chunk (and paragraph) continues
+      if (inItem && merged[merged.length - 1]) {
+        let k = j;
+        while (k < lines.length && isBlank(lines[k])) k++;
+        if (k < lines.length && leadingIndent(lines[k], 0).cols >= 4) {
+          for (let b = j; b < k; b++) {
+            paraLines.push(stripFrom(lines[b], 0, 0, 4));
+            rawLines.push(lines[b]);
+            merged.push(true);
+          }
+          j = k;
+          continue;
+        }
+      }
       break;
     }
     // a forced paragraph-text line (lazy/deep container continuation):
@@ -687,12 +713,24 @@ function parseParagraph(lines, i, refs, noSetext, textLines, inItem, docTail, en
           const hb = htmlBlockStart(line, lind.end);
           if (hb && hb.kind === 'tag') { endByBlock = true; break; }
         }
+        // a lazy line indented >= 4 in the item text is an indented code
+        // chunk in marked and merges into the paragraph (4 stripped)
+        if (lind.cols >= 4) {
+          paraLines.push(stripFrom(line, 0, 0, 4));
+          rawLines.push(line);
+          merged.push(true);
+          j++;
+          continue;
+        }
       }
       paraLines.push(line); rawLines.push(line); merged.push(false); j++; continue;
     }
     const ind = leadingIndent(line, 0);
     const sl = setextLevel(line, ind);
-    if (sl && !(noSetext && noSetext.has(j))) {
+    // marked's lheading pattern refuses to convert when the paragraph's
+    // first line itself looks like a table delimiter row (pipes, colons,
+    // dashes and spaces with at least one pipe)
+    if (sl && !(noSetext && noSetext.has(j)) && !/^ {0,3}\|?(?:[:\- ]*\|)+[:\- ]*$/.test(rawLines[0])) {
       // setext heading text is the raw paragraph text (no code merging)
       const text = rawLines.join('\n').replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
       return { nodes: [{ t: 'heading', level: sl, text }], end: j + 1 };
@@ -721,7 +759,10 @@ function parseParagraph(lines, i, refs, noSetext, textLines, inItem, docTail, en
     merged.push(false);
     j++;
   }
-  return { nodes: [{ t: 'para', text: paraText(paraLines, merged, endByBlock) }], end: j };
+  // the trailing-'\n' of a code-merged last line also appears when the
+  // paragraph is the item's last block and marked's item text ends with
+  // exactly one newline (one blank line before the next sibling item)
+  return { nodes: [{ t: 'para', text: paraText(paraLines, merged, endByBlock || (trailNl && j >= lines.length)) }], end: j };
 }
 
 // Consume an HTML block starting at lines[i]. Returns { node, end }.
@@ -1028,6 +1069,7 @@ function parseList(lines, i, refs, endsWithNl) {
     }
     j++;
     let itemDone = false;
+    let itemTrailNl = false;
     while (j < lines.length && !itemDone && !endList) {
       const L = lines[j];
       if (isBlank(L)) {
@@ -1056,8 +1098,11 @@ function parseList(lines, i, refs, endsWithNl) {
           break;
         }
         if (nextItem && sameList(first, nextItem) && kind.cols < ci) {
-          // blank line between items -> loose, item ends
+          // blank line between items -> loose, item ends; marked's item
+          // text ends with exactly one '\n' when the blank run has length
+          // 1 (it matters only for a code-merged last paragraph line)
           betweenLoose = true;
+          itemTrailNl = (k - blankStart === 1);
           j = k;
           itemDone = true;
           break;
@@ -1103,17 +1148,18 @@ function parseList(lines, i, refs, endsWithNl) {
         continue;
       }
       // dedented line: appended lazily unless the previous gathered line
-      // forces a break (blank, deep, or itself a block begin)
-      const prevM = itemLines[itemLines.length - 1];
+      // forces a break (blank, deep, or itself a block begin); a previous
+      // lazy line kept verbatim counts by its merged (post-strip) indent
+      let prevM = itemLines[itemLines.length - 1];
+      if (textLines.has(itemLines.length - 1) && leadingIndent(prevM, 0).cols >= 4) {
+        prevM = stripFrom(prevM, 0, 0, 4);
+      }
       if (prevBlank || prevLineBreak(prevM, ci)) { endList = true; break; }
       textLines.add(itemLines.length);
       sawContent = true;
-      if (/^ {0,3}(?:=+|-+) *$/.test(L) && lastKind === 'para') {
-        // setext-shaped lazy line: rewritten with a 4-space prefix
-        itemLines.push('    ' + L.replace(/^ {0,3}/, ''));
-      } else {
-        itemLines.push(lind.cols >= 4 ? stripFrom(L, 0, 0, 4) : L);
-      }
+      // lazy lines are appended verbatim (marked's textLine); an indented
+      // (>= 4) one is merged as indented code when the item is lexed
+      itemLines.push(L);
       lastDeep = false;
       prevBlank = false;
       j++;
@@ -1127,7 +1173,7 @@ function parseList(lines, i, refs, endsWithNl) {
     if (trimmed.length && (endList || j >= lines.length)) {
       trimmed[trimmed.length - 1] = trimmed[trimmed.length - 1].replace(/[ \t]+$/, '');
     }
-    const children = parseBlocks(trimmed, refs, false, null, syntheticBlanks, textLines, true);
+    const children = parseBlocks(trimmed, refs, false, null, syntheticBlanks, textLines, true, false, itemTrailNl);
     items.push(children);
     if (itemDone) continue;
   }
@@ -1171,7 +1217,7 @@ function isLazyTextLine(itemLines) {
   return false;
 }
 
-function parseBlocks(lines, refs, endsWithNl, noSetext, syntheticBlanks, textLines, inItem, docTail) {
+function parseBlocks(lines, refs, endsWithNl, noSetext, syntheticBlanks, textLines, inItem, docTail, trailNl) {
   const nodes = [];
   let i = 0;
   const n = lines.length;
@@ -1261,7 +1307,7 @@ function parseBlocks(lines, refs, endsWithNl, noSetext, syntheticBlanks, textLin
       continue;
     }
     // paragraph / setext heading / table conversion
-    const r = parseParagraph(lines, i, refs, noSetext, textLines, inItem, docTail, endsWithNl);
+    const r = parseParagraph(lines, i, refs, noSetext, textLines, inItem, docTail, endsWithNl, trailNl);
     for (const nd of r.nodes) push(nd);
     i = r.end;
   }
@@ -1481,6 +1527,12 @@ function maskStepB(t) {
   let plain = 0;
   let i = 0;
   while (i < n) {
+    // jump to the next backtick or backslash (the only interesting chars)
+    const nb = t.indexOf('`', i);
+    const ns = t.indexOf('\\', i);
+    const nxt = nb === -1 ? ns : ns === -1 ? nb : Math.min(nb, ns);
+    if (nxt === -1) break;
+    i = nxt;
     const c = t[i];
     if (c === '`') {
       let L = 0;
@@ -1522,7 +1574,15 @@ function maskStepB(t) {
 function maskLinkConstructEnd(t, i) {
   const n = t.length;
   let k = i + 1;
-  while (k < n) {
+  // fast path: the label ends at the first ']' when no backtick or '['
+  // precedes it (no code region or nesting to step over)
+  const firstClose = t.indexOf(']', i + 1);
+  if (firstClose !== -1) {
+    const tick = t.indexOf('`', i + 1);
+    const open = t.indexOf('[', i + 1);
+    if ((tick === -1 || firstClose < tick) && (open === -1 || firstClose < open)) k = firstClose;
+  }
+  while (k < n && t[k] !== ']') {
     const c = t[k];
     if (c === '`') {
       const e = maskRegionEnd(t, k);
@@ -1531,7 +1591,6 @@ function maskLinkConstructEnd(t, i) {
       continue;
     }
     if (c === '[') return -1;
-    if (c === ']') break;
     k++;
   }
   if (k >= n || t[k] !== ']' || t[k + 1] !== '(') return -1;
@@ -1565,6 +1624,20 @@ function maskBlockSkip(t) {
   let i = 0;
   while (i < n) {
     const c = t[i];
+    // the code-region-with-prefix alternative can only start one char
+    // before a backtick; other alternatives start at '[', '`' (pos 0) or '<'
+    if (c !== '[' && c !== '<' && c !== '`' && t[i + 1] !== '`') {
+      let nxt = -1;
+      const nb = t.indexOf('[', i + 1);
+      if (nb !== -1) nxt = nb;
+      const nl = t.indexOf('<', i + 1);
+      if (nl !== -1 && (nxt === -1 || nl < nxt)) nxt = nl;
+      const nt = t.indexOf('`', i + 1);
+      if (nt !== -1 && (nxt === -1 || nt - 1 < nxt)) nxt = nt - 1;
+      if (nxt === -1) break;
+      i = nxt;
+      continue;
+    }
     let end = -1, prefixLen = 0;
     if (c === '[') {
       end = maskLinkConstructEnd(t, i);
